@@ -33,9 +33,9 @@ jobs:
     permissions:
       contents: read
     env:
-      HUSKY: '0'
-      NX_NO_CLOUD: 'true'
-      NX_DAEMON: 'false'
+      HUSKY: "0"
+      NX_NO_CLOUD: "true"
+      NX_DAEMON: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
