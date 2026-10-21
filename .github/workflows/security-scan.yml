@@ -1,0 +1,140 @@
+# Reusable security checks for every repo (architecture §10.2, §15.6):
+# gitleaks (leaked secrets), Semgrep (SAST), Trivy (vulnerable dependencies
+# and misconfigurations), and optionally GitHub dependency review.
+#
+# Scanners are downloaded as pinned releases and checked against their
+# published SHA-256, or run from a digest-pinned image, so no third-party
+# action code runs here. Dependabot can't update these pins: bump the
+# versions and hashes below by hand (take releases at least two weeks old).
+name: security-scan
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-config:
+        description: Space-separated Semgrep configs (registry rulesets or paths)
+        type: string
+        default: p/default p/typescript p/nodejs p/github-actions
+      trivy-severity:
+        description: Comma-separated severities that fail the Trivy scan
+        type: string
+        default: HIGH,CRITICAL
+      dependency-review:
+        description: >-
+          Run GitHub dependency review on pull requests. Private repos need
+          GitHub Code Security for this, so it is off by default.
+        type: boolean
+        default: false
+      timeout-minutes:
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb # linux_x64
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f # Linux-64bit
+
+jobs:
+  gitleaks:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # scan every commit, not just the final tree
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$file"
+          echo "$GITLEAKS_SHA256  $RUNNER_TEMP/$file" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" gitleaks
+
+      # Pull requests scan only their own commits; main and manual runs scan
+      # the whole history. A `.gitleaks.toml` in the repo root is picked up.
+      - name: Scan for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            "$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="$PR_BASE..HEAD" .
+          else
+            "$RUNNER_TEMP/gitleaks" git --redact --no-banner .
+          fi
+
+  semgrep:
+    name: code (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.180.0@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # --baseline-commit needs the merge base
+          persist-credentials: false
+
+      # On pull requests only findings the PR introduces fail the job.
+      - name: Scan code
+        env:
+          CONFIGS: ${{ inputs.semgrep-config }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          set --
+          for c in $CONFIGS; do set -- "$@" --config "$c"; done
+          if [ "$EVENT" = pull_request ]; then set -- "$@" --baseline-commit "$PR_BASE"; fi
+          semgrep scan --error --metrics=off "$@" .
+
+  trivy:
+    name: dependencies and config (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy
+        run: |
+          file="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/$file"
+          echo "$TRIVY_SHA256  $RUNNER_TEMP/$file" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" trivy
+
+      # Dev dependencies are included: build tooling runs in CI too.
+      # Accepted findings go in a `.trivyignore` with a reason and expiry.
+      - name: Scan dependencies and configuration
+        env:
+          SEVERITY: ${{ inputs.trivy-severity }}
+        run: |
+          "$RUNNER_TEMP/trivy" fs --scanners vuln,misconfig --include-dev-deps \
+            --ignore-unfixed --severity "$SEVERITY" --exit-code 1 --no-progress .
+
+  dependency-review:
+    name: new dependencies (dependency review)
+    if: inputs.dependency-review && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
